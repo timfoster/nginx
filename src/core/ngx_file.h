@@ -29,6 +29,7 @@ struct ngx_file_s {
 
     unsigned                   valid_info:1;
     unsigned                   directio:1;
+    unsigned                   fsync:1;
 };
 
 
