@@ -601,6 +601,13 @@ mpu_convert_md5(mpu_request_t *mpcr)
 static boolean_t
 mpu_determine_output_md5(mpu_request_t *mpcr, int fd)
 {
+	/*
+	 * It's possible we have already started calculating the md5 sum of the
+	 * object before this function is called, so we need to reinitialize the
+	 * state of the md5 sum before starting from the beginning of the object.
+	 */
+	ngx_md5_init(&mpcr->mpcr_md5);
+
 	for (;;) {
 		ssize_t ret;
 
