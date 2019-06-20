@@ -255,5 +255,7 @@ HTTP_MPU_COMMIT_SRCS="src/http/modules/mpu/ngx_http_mpu_commit_module.c \
 	src/http/modules/mpu/deps/jsonemitter.c \
 	src/http/modules/mpu/deps/json-nvlist.c"
 
+HTTP_SNAPLINK_MODULE=ngx_http_snaplink_module
+HTTP_SNAPLINK_SRCS="src/http/modules/snaplink/ngx_http_snaplink_module.c"
 
 HTTP_FILE_CACHE_SRCS=src/http/ngx_http_file_cache.c
