@@ -63,11 +63,15 @@
  * If 'snaplink_enabled' has been set to on, then we proceed to process the
  * request as a snaplink. This happens in a few high-level steps:
  *
- * 1. Determine the source from the XXX header
+ * 1. Determine the source from the SOURCE_HEADER_NAME header
  * 2. Ensure the target directory exists
  * 3. link() the target
  * 4. Return success or error
  *
+ *
+ * References:
+ *
+ *  - http://mailman.nginx.org/pipermail/nginx/2007-August/001559.html
  */
 
 #include <ngx_config.h>
@@ -75,11 +79,14 @@
 #include <ngx_http.h>
 #include <ngx_thread_pool.h>
 #include <ngx_md5.h>
-#include <strings.h>
+
+#include <atomic.h>
 #include <libgen.h>
 #include <stdarg.h>
+#include <strings.h>
 #include <sys/debug.h>
-#include <atomic.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 
@@ -94,46 +101,15 @@
 #error "incorrect value for _FILE_OFFSET_BITS"
 #endif
 
+#define SOURCE_HEADER_NAME "Snaplink-Source"
+
 typedef struct {
     ngx_flag_t      snap_enabled;
     ngx_str_t       snap_root;
 } snaplink_loc_conf_t;
 
-/*
- * This is a per-request structure that is allocated as part of the thread pool
- * task allocation.
- */
-typedef struct {
-    ngx_http_request_t  *snapr_http;
-    ngx_thread_task_t   *snapr_task;
-    char            *snapr_buf;
-    size_t          snapr_buflen;
-    const char      *snapr_account;
-    const char      *snapr_objid;
-    const char      *snapr_root;
-    const char      *snapr_req_md5;
-    int64_t         snapr_nbytes;
-    ngx_int_t       snapr_status;
-    ngx_buf_t       snapr_ngx_buf;
-} snaplink_request_t;
-
 /* Forwards */
 ngx_module_t ngx_http_snaplink_module;
-
-/*
- * Stat to keep track of times we can't schedule data on a thread pool.
- */
-volatile uint64_t snaplink_overloads;
-
-/*
- * Basically we want a way to indicate in a few functions that the target file
- * already exists. Hence the SNAPLINK_EALREADY.
- */
-typedef enum {
-    SNAPLINK_FAILURE = -1,
-    SNAPLINK_SUCCESS = 0,
-    SNAPLINK_EALREADY = 1
-} snaplink_status_t;
 
 static ngx_command_t  snaplink_commands[] = {
     { ngx_string("snaplink_enabled"),
@@ -191,6 +167,7 @@ snaplink_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
 /*
  * This is the primary function that is called by nginx to handle a request.
+ *
  */
 static ngx_int_t
 snaplink_handler(ngx_http_request_t *r)
@@ -198,11 +175,18 @@ snaplink_handler(ngx_http_request_t *r)
     snaplink_loc_conf_t *conf;
     ngx_list_t list;
     ngx_list_part_t *part;
-    char **data;
-    unsigned int i;
+    ngx_table_elt_t *data;
+    ngx_uint_t i;
+    char *errstr;
+    char *last_slash;
+    int saved_errno;
+    char source[PATH_MAX];
+    char target[PATH_MAX];
+    char target_dir[PATH_MAX];
 
     conf = ngx_http_get_module_loc_conf(r, ngx_http_snaplink_module);
     if (conf->snap_enabled != 1) {
+        // This is not a request for us!
         return (NGX_DECLINED);
     }
 
@@ -212,9 +196,14 @@ snaplink_handler(ngx_http_request_t *r)
         return (NGX_HTTP_NOT_ALLOWED);
     }
 
-/*
-        int link(const char *existing, const char *new);
- */
+    /*
+     * NOTE:
+     *
+     * nginx has an faster hashed version of header lookup, but does not make it
+     * clear how to get your headers hashed so we don't currently use that. See:
+     *
+     * https://www.nginx.com/resources/wiki/start/topics/examples/headers_management/#quick-search-with-hash
+     */
 
     list = r->headers_in.headers;
     part = &list.part;
@@ -230,11 +219,59 @@ snaplink_handler(ngx_http_request_t *r)
             i = 0;
         }
 
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, data[i]);
-    }
-    r->request_body_file_log_level = 0;
+        if (strncasecmp((const char *)data[i].key.data, SOURCE_HEADER_NAME, sizeof(SOURCE_HEADER_NAME) - 1) == 0) {
+            // XXX check results
+            strcpy(source, "/manta/");
+            strncat(source, (const char *)data[i].value.data, data[i].value.len);
+            strcpy(target, "/manta/");
+            strncat(target, (const char *)r->uri.data + strlen("/snaplink/v1/"), r->uri.len - strlen("/snaplink/v1/"));
+            strcpy(target_dir, target);
 
-    return (NGX_HTTP_NOT_ALLOWED);
+            // TODO: validate all these strings look how we expect.
+
+            last_slash = strrchr(target_dir, '/');
+            if (last_slash == NULL) {
+                // XXX What errors should we handle?
+                break;
+            }
+            last_slash[0] = '\0';
+
+            errno = 0;
+            if ((mkdir(target_dir, 0755) != 0) && (errno != EEXIST)) {
+
+                // strerror might change errno, so we save the original
+                saved_errno = errno;
+                errstr = strerror(errno);
+
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "failed to create target_dir[%s]: '%s' %d", target_dir, errstr, saved_errno);
+                return (NGX_HTTP_INTERNAL_SERVER_ERROR);
+            } else {
+                // TODO: NGX_LOG_DEBUG?
+                ngx_log_error(NGX_LOG_INFO, r->connection->log, 0, "created target_dir[%s]", target_dir);
+            }
+
+            errno = 0;
+            if (link(source, target) != 0) {
+                if (errno == ENOENT) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "source[%s] does not exist, cannot create link target[%s]", source, target);
+                    return (NGX_HTTP_NOT_FOUND);
+                }
+
+                // strerror might change errno, so we save the original
+                saved_errno = errno;
+                errstr = strerror(errno);
+
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "failed to link source[%s] to target[%s]: '%s' (%d)", source, target, errstr, saved_errno);
+                return (NGX_HTTP_INTERNAL_SERVER_ERROR);
+            } else {
+                // TODO: NGX_LOG_DEBUG?
+                ngx_log_error(NGX_LOG_INFO, r->connection->log, 0, "linked source[%s] to target[%s]", source, target);
+                return (NGX_HTTP_NO_CONTENT);
+            }
+        }
+    }
+
+    return (NGX_HTTP_BAD_REQUEST);
 }
 
 static ngx_int_t
@@ -256,31 +293,31 @@ snaplink_init(ngx_conf_t *cf)
 }
 
 static ngx_http_module_t ngx_http_snaplink_module_ctx = {
-    NULL,           /* preconfiguration */
-    snaplink_init,      /* postconfiguration */
+    NULL,                     /* preconfiguration */
+    snaplink_init,            /* postconfiguration */
 
-    NULL,           /* create main configuration */
-    NULL,           /* init main configuration */
+    NULL,                     /* create main configuration */
+    NULL,                     /* init main configuration */
 
-    NULL,           /* create server configuration */
-    NULL,           /* merge server configuration */
+    NULL,                     /* create server configuration */
+    NULL,                     /* merge server configuration */
 
-    snaplink_create_loc_conf,   /* create location configuration */
-    snaplink_merge_loc_conf /* merge location configuration */
+    snaplink_create_loc_conf, /* create location configuration */
+    snaplink_merge_loc_conf   /* merge location configuration */
 
 };
 
 ngx_module_t ngx_http_snaplink_module = {
     NGX_MODULE_V1,
     &ngx_http_snaplink_module_ctx,  /* module context */
-    snaplink_commands,            /* module directives */
-    NGX_HTTP_MODULE,          /* module type */
-    NULL,                 /* init master */
-    NULL,                 /* init module */
-    NULL,                 /* init process */
-    NULL,                 /* init thread */
-    NULL,                 /* exit thread */
-    NULL,                 /* exit process */
-    NULL,                 /* exit master */
+    snaplink_commands,              /* module directives */
+    NGX_HTTP_MODULE,                /* module type */
+    NULL,                           /* init master */
+    NULL,                           /* init module */
+    NULL,                           /* init process */
+    NULL,                           /* init thread */
+    NULL,                           /* exit thread */
+    NULL,                           /* exit process */
+    NULL,                           /* exit master */
     NGX_MODULE_V1_PADDING
 };
