@@ -26,6 +26,7 @@ typedef struct {
 #if (NGX_HAVE_FSYNC)
     ngx_flag_t  fsync;
 #endif
+    ngx_thread_pool_t *dav_pool;
     ngx_flag_t  md5_header;
     ngx_uint_t  content_md5_fail_status;
 } ngx_http_dav_loc_conf_t;
@@ -37,6 +38,8 @@ typedef struct {
 } ngx_http_dav_copy_ctx_t;
 
 
+static char * ngx_http_dav_set_pool(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
 static ngx_int_t ngx_http_dav_handler(ngx_http_request_t *r);
 
 static void ngx_http_dav_put_handler(ngx_http_request_t *r);
@@ -118,6 +121,13 @@ static ngx_command_t  ngx_http_dav_commands[] = {
       NULL },
 #endif
 
+    { ngx_string("dav_pool"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_dav_set_pool,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
     { ngx_string("put_always_respond_md5"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
@@ -165,6 +175,30 @@ ngx_module_t  ngx_http_dav_module = {
     NULL,                                  /* exit master */
     NGX_MODULE_V1_PADDING
 };
+
+static char *
+ngx_http_dav_set_pool(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_str_t name;
+    ngx_thread_pool_t *tp;
+    ngx_str_t  *value;
+    ngx_http_dav_loc_conf_t *dc = conf;
+
+    value = cf->args->elts;
+    name.len = value[1].len;
+    name.data = value[1].data;
+
+    tp = ngx_thread_pool_add(cf, &name);
+    if (tp == NULL) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "invalid thread pool specified for dav module");
+            return (NGX_CONF_ERROR);
+    }
+    dc->dav_pool = tp;
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "got tp %s", value[1].data);
+
+    return (NGX_CONF_OK);
+}
 
 #if (NGX_HAVE_FSYNC)
 static ngx_int_t
@@ -256,9 +290,14 @@ ngx_http_dav_handler(ngx_http_request_t *r)
     return NGX_DECLINED;
 }
 
+typedef struct {
+    ngx_http_request_t *dr_http;
+    ngx_thread_task_t *dr_task;
+    ngx_uint_t dr_err;
+} dav_request_t;
 
 static void
-ngx_http_dav_put_handler(ngx_http_request_t *r)
+ngx_http_dav_task_handler(void *arg, ngx_log_t *log)
 {
     size_t                    root;
     time_t                    date;
@@ -271,15 +310,20 @@ ngx_http_dav_put_handler(ngx_http_request_t *r)
     ngx_str_t                 e_computed_hash;
     ngx_table_elt_t          *h;
     ngx_uint_t                failed_md5 = 0;
+    dav_request_t            *dr = arg;
+    ngx_uint_t                err = 0;
+
+    ngx_http_request_t       *r = dr->dr_http;
+    dr->dr_err = 0;
 
     if (r->request_body == NULL || r->request_body->temp_file == NULL) {
-        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-        return;
+        err = NGX_HTTP_INTERNAL_SERVER_ERROR;
+        goto out;
     }
 
     if (ngx_http_map_uri_to_path(r, &path, &root, 0) == NULL) {
-        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-        return;
+        err = NGX_HTTP_INTERNAL_SERVER_ERROR;
+        goto out;
     }
 
     path.len--;
@@ -305,8 +349,8 @@ ngx_http_dav_put_handler(ngx_http_request_t *r)
                               temp->data);
             }
 
-            ngx_http_finalize_request(r, NGX_HTTP_CONFLICT);
-            return;
+            err = NGX_HTTP_CONFLICT;
+            goto out;
         }
     }
 
@@ -335,8 +379,8 @@ ngx_http_dav_put_handler(ngx_http_request_t *r)
     if (r->request_body_md5) {
         d_computed_hash.data = ngx_palloc(r->pool, 16);
         if (d_computed_hash.data == NULL) {
-            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-            return;
+            err = NGX_HTTP_INTERNAL_SERVER_ERROR;
+            goto out;
         }
 
         ngx_md5_final(d_computed_hash.data,
@@ -346,14 +390,14 @@ ngx_http_dav_put_handler(ngx_http_request_t *r)
         e_computed_hash.data = ngx_palloc(r->pool,
             ngx_base64_encoded_length(16) + 1);
         if (e_computed_hash.data == NULL) {
-            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-            return;
+            err = NGX_HTTP_INTERNAL_SERVER_ERROR;
+            goto out;
         }
 
         ngx_encode_base64(&e_computed_hash, &d_computed_hash);
         if (e_computed_hash.len != ngx_base64_encoded_length(16)) {
-            ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);
-            return;
+            err = NGX_HTTP_BAD_REQUEST;
+            goto out;
         }
         e_computed_hash.data[e_computed_hash.len] = '\0';
     }
@@ -376,20 +420,20 @@ ngx_http_dav_put_handler(ngx_http_request_t *r)
         ngx_str_t d_client_hash;
 
         if (e_client_hash->len != ngx_base64_encoded_length(16)) {
-            ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);
-            return;
+            err = NGX_HTTP_BAD_REQUEST;
+            goto out;
         }
 
         d_client_hash.data = ngx_palloc(r->pool, 16);
         if (d_client_hash.data == NULL) {
-            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-            return;
+            err = NGX_HTTP_INTERNAL_SERVER_ERROR;
+            goto out;
         }
 
         if (ngx_decode_base64(&d_client_hash,
                               (ngx_str_t *)e_client_hash) != NGX_OK) {
-            ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);
-            return;
+            err = NGX_HTTP_BAD_REQUEST;
+            goto out;
         }
 
         if (ngx_strcmp(e_client_hash->data, e_computed_hash.data) != 0)
@@ -404,8 +448,8 @@ ngx_http_dav_put_handler(ngx_http_request_t *r)
     if (failed_md5 || dlcf->md5_header) {
         h = ngx_list_push(&r->headers_out.headers);
         if (h == NULL) {
-            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-            return;
+            err = NGX_HTTP_INTERNAL_SERVER_ERROR;
+            goto out;
         }
 
         h->hash = 1;
@@ -414,8 +458,8 @@ ngx_http_dav_put_handler(ngx_http_request_t *r)
     }
 
     if (failed_md5) {
-        ngx_http_finalize_request(r, dlcf->content_md5_fail_status);
-        return;
+        err = dlcf->content_md5_fail_status;
+        goto out;
     }
 
     /*
@@ -427,30 +471,30 @@ ngx_http_dav_put_handler(ngx_http_request_t *r)
         if (ngx_file_sync(r->request_body->temp_file->file.fd) != 0) {
             ngx_log_error(NGX_LOG_CRIT, r->connection->log, ngx_errno,
                 ngx_file_sync_n " \"%s\"", temp->data);
-            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-            return;
+            err = NGX_HTTP_INTERNAL_SERVER_ERROR;
+            goto out;
         }
     }
 #endif
 
     if (ngx_ext_rename_file(temp, &path, &ext) != NGX_OK) {
-        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-        return;
+        err = NGX_HTTP_INTERNAL_SERVER_ERROR;
+        goto out;
     }
 
 #if (NGX_HAVE_FSYNC)
     if (dlcf->fsync) {
         if (ngx_http_dav_rename_sync((const char *)temp->data) != NGX_OK) {
-            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-            return;
+            err = NGX_HTTP_INTERNAL_SERVER_ERROR;
+            goto out;
         }
     }
 #endif
 
     if (status == NGX_HTTP_CREATED) {
         if (ngx_http_dav_location(r, path.data) != NGX_OK) {
-            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-            return;
+            err = NGX_HTTP_INTERNAL_SERVER_ERROR;
+            goto out;
         }
 
         r->headers_out.content_length_n = 0;
@@ -459,8 +503,63 @@ ngx_http_dav_put_handler(ngx_http_request_t *r)
     r->headers_out.status = status;
     r->header_only = 1;
 
-    ngx_http_finalize_request(r, ngx_http_send_header(r));
+out:
+    dr->dr_err = err;
     return;
+}
+
+static void
+ngx_http_dav_post_thread(ngx_event_t *ev)
+{
+    dav_request_t *dr = ev->data;
+    ngx_http_request_t *r = dr->dr_http;
+
+    r->main->blocked--;
+    r->write_event_handler(r);
+
+    ngx_http_send_header(r);
+    ngx_http_finalize_request(r, dr->dr_err);
+
+    ngx_http_run_posted_requests(r->connection);
+}
+
+static void
+ngx_http_dav_put_handler(ngx_http_request_t *r)
+{
+    ngx_thread_task_t *task;
+    dav_request_t *dr;
+    ngx_http_dav_loc_conf_t  *dlcf;
+    dlcf = ngx_http_get_module_loc_conf(r, ngx_http_dav_module);
+
+    task = ngx_thread_task_alloc(r->pool, sizeof (dav_request_t));
+    if (task == NULL) {
+        /*atomic_inc_64(&mpu_overloads);*/
+        ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
+            "failed to allcoate dav request structure");
+        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    dr = task->ctx;
+    dr->dr_http = r;
+    dr->dr_task = task;
+
+    task->handler = ngx_http_dav_task_handler;
+    task->event.data = dr;
+    task->event.handler = ngx_http_dav_post_thread;
+
+    if (ngx_thread_task_post(dlcf->dav_pool, task) != NGX_OK) {
+		ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
+		    "failed to submit taskq entry, limit likely exceeded");
+		ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+		return;
+    }
+
+    /*
+     * Make sure the main thread doesn't clean up our state while the
+     * task runs in the thread pool
+     */
+    r->main->blocked++;
 }
 
 
@@ -1340,6 +1439,15 @@ ngx_http_dav_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_value(conf->md5_header,
                          prev->md5_header, 0);
+
+    ngx_conf_merge_ptr_value(conf->dav_pool, prev->dav_pool,
+                             NGX_CONF_UNSET_PTR);
+
+    if (conf->dav_pool == NGX_CONF_UNSET_PTR) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "missing required dav setting: \"dav_pool\"");
+        return (NGX_CONF_ERROR);
+    }
 
     return NGX_CONF_OK;
 }
